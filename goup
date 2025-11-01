@@ -1,0 +1,579 @@
+#!/bin/bash
+
+# goup - Gerenciador completo para Go (golang)
+# Instala, atualiza e gerencia versões do Go + ferramentas essenciais
+# Compatível com qualquer distribuição Linux, sem dependências de gerenciadores de pacotes
+# Inclui verificações rigorosas, logs detalhados, tratamento de erros e testes automatizados
+
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+# Configurações padrão
+readonly SCRIPT_NAME="goup"
+readonly SCRIPT_VERSION="1.0.0"
+readonly DEFAULT_INSTALL_DIR="/usr/local/go"
+readonly GO_VERSIONS_DIR="/usr/local/.go-versions"
+readonly GOUP_INSTALL_DIR="/usr/local/bin/goup"
+readonly LOG_FILE="/tmp/${SCRIPT_NAME}_$(date +%Y%m%d_%H%M%S).log"
+readonly TEMP_DIR="./tmp/${SCRIPT_NAME}_install_$$"
+
+# Cores para output (se suportado)
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m'  # No Color
+
+# Função de logging
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Função de erro
+error() {
+    log "ERROR" "${RED}$1${NC}"
+    echo -e "${RED}Erro: $1${NC}" >&2
+    cleanup
+    exit "${2:-1}"
+}
+
+# Função de sucesso
+success() {
+    log "INFO" "${GREEN}$1${NC}"
+    echo -e "${GREEN}$1${NC}"
+}
+
+# Função de aviso
+warn() {
+    log "WARN" "${YELLOW}$1${NC}"
+    echo -e "${YELLOW}Aviso: $1${NC}"
+}
+
+# Função de limpeza
+cleanup() {
+    log "INFO" "Executando limpeza..."
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+        log "INFO" "Diretório temporário removido: $TEMP_DIR"
+    fi
+    if [[ -n "${temp_file:-}" ]] && [[ -f "$temp_file" ]]; then
+        rm -f "$temp_file"
+        log "INFO" "Arquivo temporário removido: $temp_file"
+    fi
+}
+
+# Trap para limpeza em caso de interrupção
+trap cleanup SIGINT SIGTERM EXIT
+
+# Verificação de dependências
+check_dependencies() {
+    log "INFO" "Verificando dependências do sistema..."
+
+    local deps=("curl" "tar" "grep" "uname" "sha256sum")
+    local missing_deps=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        error "Dependências faltantes: ${missing_deps[*]}. Instale-as manualmente." 2
+    fi
+
+    success "Todas as dependências estão presentes."
+}
+
+# Detecção de arquitetura
+detect_arch() {
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        i386|i686) echo "386" ;;
+        *) error "Arquitetura não suportada: $arch" 3 ;;
+    esac
+}
+
+# Detecção de versão mais recente
+get_latest_version() {
+    local arch="$1"
+    log "INFO" "Buscando versão mais recente do Go para arquitetura $arch..."
+
+    local html
+    if ! html=$(curl -sL --max-time 30 https://golang.org/dl/); then
+        error "Falha ao acessar https://golang.org/dl/" 4
+    fi
+
+    local version
+    version=$(echo "$html" | grep -oP "go[0-9]+\.[0-9]+(\.[0-9]+)?\.linux-$arch\.tar\.gz" | head -n 1 | sed 's/\.linux-amd64\.tar\.gz//' | tr -d '\n\r')
+
+    if [[ -z "$version" ]]; then
+        error "Não foi possível encontrar versão do Go para arquitetura $arch" 5
+    fi
+
+    log "INFO" "Versão encontrada: $version"
+    echo "$version"
+}
+
+# Download com verificação de checksum
+download_go() {
+    local version="$1"
+    local arch="$2"
+    local url="https://golang.org/dl/${version}.linux-${arch}.tar.gz"
+    local checksum_url="${url}.sha256"
+
+    log "INFO" "Baixando Go de: $url"
+
+    if ! curl -L --max-time 300 --progress-bar "$url" -o "$temp_file"; then
+        error "Falha no download do arquivo Go" 6
+    fi
+
+    log "INFO" "Verificando checksum..."
+    local expected_checksum
+    if ! expected_checksum=$(curl -sL --max-time 30 "$checksum_url" 2>/dev/null | grep -o '[a-f0-9]\{64\}' | head -1); then
+        warn "Não foi possível obter checksum oficial. Pulando verificação."
+    else
+        local actual_checksum
+        actual_checksum=$(sha256sum "$temp_file" | cut -d' ' -f1)
+        if [[ "$actual_checksum" != "$expected_checksum" ]]; then
+            error "Checksum do arquivo não corresponde. Download possivelmente corrompido." 7
+        fi
+        success "Checksum verificado com sucesso."
+    fi
+}
+
+# Verificação de permissões
+check_permissions() {
+    local install_dir="$1"
+    log "INFO" "Verificando permissões para instalação em $install_dir"
+
+    if [[ ! -w "$(dirname "$install_dir")" ]]; then
+        error "Sem permissões de escrita em $(dirname "$install_dir"). Execute como root ou especifique --install-dir." 8
+    fi
+
+    success "Permissões adequadas confirmadas."
+}
+
+# Instalação
+install_go() {
+    local install_dir="$1"
+    local version="$2"
+    log "INFO" "Instalando Go $version em $install_dir"
+
+    # Verifica se já existe uma instalação
+    if [[ -d "$install_dir" ]]; then
+        log "WARN" "Já existe uma instalação do Go em $install_dir"
+
+        # Tenta obter versão atual
+        local current_version=""
+        if [[ -x "$install_dir/bin/go" ]]; then
+            current_version=$("$install_dir/bin/go" version 2>/dev/null | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        fi
+
+        if [[ -n "$current_version" ]]; then
+            log "INFO" "Versão atual instalada: $current_version"
+        fi
+
+        # Pergunta ao usuário o que fazer
+        echo ""
+        echo "Já existe uma instalação do Go em $install_dir"
+        if [[ -n "$current_version" ]]; then
+            echo "Versão atual: $current_version"
+        fi
+        echo ""
+        echo "Escolha uma opção:"
+        echo "1) Substituir a instalação existente (recomendado)"
+        echo "2) Manter ambas as versões (instalar em diretório de versões)"
+        echo "3) Cancelar instalação"
+        echo ""
+
+        local choice
+        read -p "Digite sua escolha (1-3): " choice
+
+        case "$choice" in
+            1)
+                log "INFO" "Removendo instalação anterior..."
+                rm -rf "$install_dir"
+                ;;
+            2)
+                # Move versão atual para diretório de versões
+                if [[ -n "$current_version" ]]; then
+                    local versions_dir="$GO_VERSIONS_DIR"
+                    mkdir -p "$versions_dir"
+                    local versioned_dir="$versions_dir/$current_version"
+                    log "INFO" "Movendo versão atual para $versioned_dir"
+                    mv "$install_dir" "$versioned_dir"
+                else
+                    # Remove instalação sem versão identificada
+                    rm -rf "$install_dir"
+                fi
+
+                # Instala nova versão no diretório padrão
+                log "INFO" "Instalando nova versão no diretório padrão"
+                ;;
+            3)
+                log "INFO" "Instalação cancelada pelo usuário"
+                cleanup
+                exit 0
+                ;;
+            *)
+                error "Escolha inválida. Instalação cancelada." 13
+                ;;
+        esac
+    fi
+
+    # Cria diretório pai se necessário
+    mkdir -p "$(dirname "$install_dir")"
+
+    # Extrai
+    log "INFO" "Extraindo arquivo para $(dirname "$install_dir")"
+    if ! tar -C "$(dirname "$install_dir")" -xzf "$temp_file"; then
+        error "Falha ao extrair arquivo Go" 9
+    fi
+
+    success "Go $version instalado com sucesso em $install_dir"
+}
+
+# Configuração do PATH
+configure_path() {
+    local install_dir="$1"
+    local bashrc="$HOME/.bashrc"
+    local profile="$HOME/.profile"
+
+    log "INFO" "Configurando PATH..."
+
+    local path_line="export PATH=\$PATH:$install_dir/bin"
+
+    # Adiciona ao .bashrc se não existir
+    if [[ -f "$bashrc" ]] && ! grep -q "$path_line" "$bashrc"; then
+        echo "$path_line" >> "$bashrc"
+        log "INFO" "PATH adicionado ao $bashrc"
+    fi
+
+    # Adiciona ao .profile se não existir
+    if [[ -f "$profile" ]] && ! grep -q "$path_line" "$profile"; then
+        echo "$path_line" >> "$profile"
+        log "INFO" "PATH adicionado ao $profile"
+    fi
+
+    # Define PATH para sessão atual
+    export PATH="$PATH:$install_dir/bin"
+    success "PATH configurado. Execute 'source ~/.bashrc' ou reinicie o terminal."
+}
+
+
+# Validação da instalação
+validate_installation() {
+    local install_dir="$1"
+    local expected_version="$2"
+
+    log "INFO" "Validando instalação..."
+
+    if [[ ! -x "$install_dir/bin/go" ]]; then
+        error "Executável go não encontrado em $install_dir/bin" 10
+    fi
+
+    local installed_version
+    installed_version=$("$install_dir/bin/go" version 2>/dev/null | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+
+    if [[ -z "$installed_version" ]]; then
+        error "Não foi possível obter versão do Go instalado" 11
+    fi
+
+    if [[ "$installed_version" != "$expected_version" ]]; then
+        warn "Versão instalada ($installed_version) difere da esperada ($expected_version)"
+    else
+        success "Versão validada: $installed_version"
+    fi
+}
+
+# Instalar ferramentas essenciais do Go
+install_tools() {
+    local install_dir="$1"
+    log "INFO" "Instalando ferramentas essenciais do Go..."
+
+    local tools=(
+        "golang.org/x/tools/cmd/goimports@latest"
+        "honnef.co/go/tools/cmd/staticcheck@latest"
+        "github.com/cosmtrek/air@latest"
+        "github.com/go-delve/delve/cmd/dlv@latest"
+    )
+
+    for tool in "${tools[@]}"; do
+        log "INFO" "Instalando $tool"
+        if ! "$install_dir/bin/go" install "$tool" >/dev/null 2>&1; then
+            warn "Falha ao instalar $tool"
+        else
+            success "Instalado: $tool"
+        fi
+    done
+
+    # Instalar golangci-lint separadamente (não é um binário Go)
+    log "INFO" "Instalando golangci-lint..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$install_dir/bin" v1.55.2 >/dev/null 2>&1 && success "golangci-lint instalado" || warn "Falha ao instalar golangci-lint"
+    else
+        warn "curl não disponível, pulando golangci-lint"
+    fi
+}
+
+# Testes automatizados
+run_tests() {
+    log "INFO" "Executando testes automatizados..."
+
+    # Cria projeto de teste temporário
+    local test_dir="$TEMP_DIR/test_project"
+    mkdir -p "$test_dir"
+    cd "$test_dir"
+
+    # Inicializa módulo
+    if ! "$install_dir/bin/go" mod init test >/dev/null 2>&1; then
+        warn "Falha ao inicializar módulo de teste"
+        return
+    fi
+
+    # Cria arquivo de teste simples
+    cat > main_test.go << 'EOF'
+package main
+
+import "testing"
+
+func TestExample(t *testing.T) {
+    if 1+1 != 2 {
+        t.Error("Matemática básica falhou")
+    }
+}
+EOF
+
+    # Executa testes
+    if "$install_dir/bin/go" test -v -race . >/dev/null 2>&1; then
+        success "Testes automatizados passaram"
+    else
+        warn "Alguns testes falharam. Verifique manualmente com 'go test -v -race'"
+    fi
+
+    cd - >/dev/null
+}
+
+# Auto-instalação do goup
+self_install() {
+    log "INFO" "Instalando goup em $GOUP_INSTALL_DIR"
+
+    # Cria diretório se necessário
+    mkdir -p "$(dirname "$GOUP_INSTALL_DIR")"
+
+    # Copia o script para o local do sistema
+    cp "$0" "$GOUP_INSTALL_DIR"
+    chmod +x "$GOUP_INSTALL_DIR"
+
+    success "goup instalado em $GOUP_INSTALL_DIR"
+    echo ""
+    echo "Agora você pode usar 'goup' de qualquer lugar!"
+    echo "Exemplos:"
+    echo "  goup --help          # Ver ajuda"
+    echo "  goup --list          # Listar versões"
+    echo "  goup --switch go1.21.5  # Alternar versão"
+    echo "  goup --update-tools  # Atualizar ferramentas"
+}
+
+# Listar versões instaladas
+list_versions() {
+    local versions_dir="$GO_VERSIONS_DIR"
+    if [[ -d "$versions_dir" ]]; then
+        echo "Versões instaladas em $versions_dir:"
+        ls -1 "$versions_dir" | while read -r version_dir; do
+            if [[ -d "$versions_dir/$version_dir" && -x "$versions_dir/$version_dir/bin/go" ]]; then
+                local ver=$("$versions_dir/$version_dir/bin/go" version 2>/dev/null | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "desconhecida")
+                echo "  $version_dir ($ver)"
+            fi
+        done
+    else
+        echo "Nenhuma versão adicional instalada."
+    fi
+
+    # Verifica versão padrão
+    if [[ -d "$DEFAULT_INSTALL_DIR" && -x "$DEFAULT_INSTALL_DIR/bin/go" ]]; then
+        local default_ver=$("$DEFAULT_INSTALL_DIR/bin/go" version 2>/dev/null | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "desconhecida")
+        echo ""
+        echo "Versão padrão: $default_ver ($DEFAULT_INSTALL_DIR)"
+    fi
+}
+
+# Alternar versão padrão
+switch_version() {
+    local target_version="$1"
+    local versions_dir="$GO_VERSIONS_DIR"
+    local target_dir="$versions_dir/$target_version"
+
+    if [[ ! -d "$target_dir" ]]; then
+        error "Versão $target_version não encontrada em $versions_dir" 14
+    fi
+
+    log "INFO" "Alternando para versão $target_version"
+
+    # Backup da versão atual se existir
+    if [[ -d "$DEFAULT_INSTALL_DIR" ]]; then
+        local current_ver=""
+        if [[ -x "$DEFAULT_INSTALL_DIR/bin/go" ]]; then
+            current_ver=$("$DEFAULT_INSTALL_DIR/bin/go" version 2>/dev/null | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "unknown")
+        fi
+        if [[ -n "$current_ver" && "$current_ver" != "$target_version" ]]; then
+            local backup_dir="$versions_dir/$current_ver"
+            mkdir -p "$versions_dir"
+            log "INFO" "Fazendo backup da versão atual $current_ver"
+            mv "$DEFAULT_INSTALL_DIR" "$backup_dir"
+        else
+            rm -rf "$DEFAULT_INSTALL_DIR"
+        fi
+    fi
+
+    # Cria link simbólico ou move para diretório padrão
+    mkdir -p "$(dirname "$DEFAULT_INSTALL_DIR")"
+    mv "$target_dir" "$DEFAULT_INSTALL_DIR"
+
+    success "Versão padrão alterada para $target_version"
+    configure_path "$DEFAULT_INSTALL_DIR"
+}
+
+# Função principal
+main() {
+    local install_dir="$DEFAULT_INSTALL_DIR"
+    local version=""
+    local arch=""
+    local install_tools_flag=false
+    local self_install_flag=false
+
+    # Parsing de argumentos
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --version)
+                version="$2"
+                shift 2
+                ;;
+            --install-dir)
+                install_dir="$2"
+                shift 2
+                ;;
+            --install-tools)
+                install_tools_flag=true
+                shift
+                ;;
+            --self-install)
+                self_install_flag=true
+                shift
+                ;;
+            --list)
+                list_versions
+                exit 0
+                ;;
+            --switch)
+                switch_version "$2"
+                exit 0
+                ;;
+            --update-tools)
+                if [[ -d "$DEFAULT_INSTALL_DIR" && -x "$DEFAULT_INSTALL_DIR/bin/go" ]]; then
+                    install_tools "$DEFAULT_INSTALL_DIR"
+                    success "Ferramentas atualizadas!"
+                else
+                    error "Go não está instalado. Instale primeiro com: $0" 15
+                fi
+                exit 0
+                ;;
+            --help)
+                echo "goup - Gerenciador completo para Go"
+                echo ""
+                echo "Uso: $0 [--version VERSION] [--install-dir DIR] [OPÇÕES]"
+                echo ""
+                echo "Instalação:"
+                echo "  --version VERSION     Versão específica do Go (ex: go1.21.0)"
+                echo "  --install-dir DIR     Diretório de instalação (padrão: $DEFAULT_INSTALL_DIR)"
+                echo "  --install-tools       Instalar ferramentas essenciais após Go"
+                echo "  --self-install        Instalar goup no sistema (/usr/local/bin/goup)"
+                echo ""
+                echo "Gerenciamento:"
+                echo "  --list                Listar versões instaladas"
+                echo "  --switch VERSION      Alternar versão padrão (ex: go1.21.5)"
+                echo "  --update-tools        Atualizar ferramentas essenciais"
+                echo ""
+                echo "Exemplos:"
+                echo "  $0                           # Instalar versão mais recente"
+                echo "  $0 --version go1.21.5        # Instalar versão específica"
+                echo "  $0 --install-tools           # Instalar com ferramentas"
+                echo "  $0 --self-install            # Auto-instalar goup"
+                echo "  $0 --list                    # Listar versões"
+                echo "  $0 --switch go1.21.5         # Alternar versão"
+                exit 0
+                ;;
+            *)
+                error "Argumento desconhecido: $1. Use --help para ver opções disponíveis." 12
+                ;;
+        esac
+    done
+
+    # Se for apenas auto-instalação
+    if [[ "$self_install_flag" == true && $# -eq 1 ]]; then
+        self_install
+        exit 0
+    fi
+
+    log "INFO" "Iniciando instalação do Go com goup v$SCRIPT_VERSION"
+    log "INFO" "Log salvo em: $LOG_FILE"
+
+    check_dependencies
+
+    arch=$(detect_arch)
+    log "INFO" "Arquitetura detectada: $arch"
+
+    if [[ -z "$version" ]]; then
+        version=$(get_latest_version "$arch")
+    else
+        log "INFO" "Usando versão especificada: $version"
+    fi
+
+    temp_file="$TEMP_DIR/${version}.linux-${arch}.tar.gz"
+    mkdir -p "$TEMP_DIR"
+
+    check_permissions "$install_dir"
+    download_go "$version" "$arch"
+    install_go "$install_dir" "$version"
+    configure_path "$install_dir"
+    validate_installation "$install_dir" "$version"
+    run_tests
+
+    # Instalar ferramentas se solicitado
+    if [[ "$install_tools_flag" == true ]]; then
+        install_tools "$install_dir"
+    fi
+
+    # Auto-instalar goup se solicitado
+    if [[ "$self_install_flag" == true ]]; then
+        self_install
+    fi
+
+    success "Instalação do Go $version concluída com sucesso!"
+    echo ""
+    echo "🚀 Go $version está pronto para uso!"
+    echo ""
+    echo "Para ativar na sessão atual:"
+    echo "  source ~/.bashrc"
+    echo ""
+    echo "Para verificar:"
+    echo "  go version"
+    echo ""
+    echo "Para gerenciar versões:"
+    echo "  goup --list                    # Listar versões"
+    echo "  goup --switch go1.21.5         # Alternar versão"
+    echo "  goup --update-tools            # Atualizar ferramentas"
+    echo ""
+    if [[ "$install_tools_flag" == false ]]; then
+        echo "💡 Dica: Use --install-tools na próxima instalação para incluir ferramentas essenciais!"
+    fi
+    echo ""
+    echo "Log detalhado disponível em: $LOG_FILE"
+}
+
+# Executa função principal
+main "$@"
