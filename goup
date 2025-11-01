@@ -126,6 +126,7 @@ download_go() {
     local checksum_url="${url}.sha256"
 
     log "INFO" "Baixando Go de: $url"
+    log "INFO" "Arquivo temporário: $temp_file"
 
     if ! curl -L --max-time 300 --progress-bar "$url" -o "$temp_file"; then
         error "Falha no download do arquivo Go" 6
