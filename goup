@@ -125,6 +125,10 @@ download_go() {
     local url="https://golang.org/dl/${version}.linux-${arch}.tar.gz"
     local checksum_url="${url}.sha256"
 
+    log "INFO" "Construindo URL de download..."
+    log "INFO" "Versão: $version"
+    log "INFO" "Arquitetura: $arch"
+    log "INFO" "URL completa: $url"
     log "INFO" "Baixando Go de: $url"
     log "INFO" "Arquivo temporário: $temp_file"
 
