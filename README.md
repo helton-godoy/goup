@@ -20,7 +20,7 @@
 
 ```bash
 # Baixe o script
-curl -fsSL https://raw.githubusercontent.com/helton-godoy/goup/main/goup -o goup
+curl -fsSL https://raw.githubusercontent.com/helton-godoy/goup/master/goup -o goup
 chmod +x goup
 
 # Instale Go + ferramentas essenciais + goup globalmente
