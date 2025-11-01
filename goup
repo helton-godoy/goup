@@ -108,7 +108,7 @@ get_latest_version() {
     fi
 
     local version
-    version=$(echo "$html" | grep -oP "go[0-9]+\.[0-9]+(\.[0-9]+)?\.linux-$arch\.tar\.gz" | head -n 1 | sed 's/\.linux-amd64\.tar\.gz//' | tr -d '\n\r')
+    version=$(echo "$html" | grep -oP "go[0-9]+\.[0-9]+(\.[0-9]+)?\.linux-$arch\.tar\.gz" | head -n 1 | sed 's/\.linux-.*\.tar\.gz//' | tr -d '\n\r')
 
     if [[ -z "$version" ]]; then
         error "Não foi possível encontrar versão do Go para arquitetura $arch" 5
